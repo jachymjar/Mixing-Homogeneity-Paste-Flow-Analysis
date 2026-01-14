@@ -1,0 +1,1136 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import os
+from tkinter import *
+from tkinter import filedialog, messagebox
+
+
+
+# -------- OpenCV callbacks shared state --------
+_calib_points = []
+_centerline_points = []
+_click_point = None
+_click_ready = False
+_roi_start = None
+_roi_end = None
+_roi_ready = False
+_zero_point = None
+_zero_ready = False
+
+
+
+def _reset_calib_points():
+    global _calib_points
+    _calib_points = []
+
+
+
+def _reset_centerline_points():
+    global _centerline_points
+    _centerline_points = []
+
+
+
+def _reset_zero_point():
+    global _zero_point, _zero_ready
+    _zero_point = None
+    _zero_ready = False
+
+
+
+def _on_mouse_calib(event, x, y, flags, param):
+    global _calib_points
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if len(_calib_points) < 2:
+            _calib_points.append((x, y))
+
+
+
+def _on_mouse_centerline(event, x, y, flags, param):
+    global _centerline_points
+    if event == cv2.EVENT_LBUTTONDOWN:
+        if len(_centerline_points) < 2:
+            _centerline_points.append((x, y))
+
+
+
+def _on_mouse_track(event, x, y, flags, param):
+    global _click_point, _click_ready
+    if event == cv2.EVENT_LBUTTONDOWN:
+        _click_point = (x, y)
+        _click_ready = True
+
+
+
+def _on_mouse_roi(event, x, y, flags, param):
+    global _roi_start, _roi_end, _roi_ready
+    if event == cv2.EVENT_LBUTTONDOWN:
+        _roi_start = (x, y)
+        _roi_end = None
+        _roi_ready = False
+    elif event == cv2.EVENT_MOUSEMOVE and _roi_start is not None:
+        _roi_end = (x, y)
+    elif event == cv2.EVENT_LBUTTONUP and _roi_start is not None:
+        _roi_end = (x, y)
+        _roi_ready = True
+
+
+
+def _on_mouse_zero(event, x, y, flags, param):
+    """Single click for zero point selection (can be moved by clicking again)."""
+    global _zero_point, _zero_ready
+    if event == cv2.EVENT_LBUTTONDOWN:
+        _zero_point = (x, y)
+        _zero_ready = True
+
+
+
+# -------- Geometry helper --------
+
+
+
+def project_point_to_line(pt, p1, p2):
+    x, y = pt
+    x1, y1 = p1
+    x2, y2 = p2
+    vx = x2 - x1
+    vy = y2 - y1
+    denom = vx * vx + vy * vy
+    if denom == 0:
+        return p1, 0.0
+    t = ((x - x1) * vx + (y - y1) * vy) / denom
+    px = x1 + t * vx
+    py = y1 + t * vy
+    s = t * np.sqrt(denom)
+    return (px, py), s
+
+
+
+# -------- Smoothing helpers --------
+
+
+
+def moving_average(x, window):
+    """
+    Symmetric moving average with edge padding.
+    Output has same length as input.
+    """
+    x = np.asarray(x, dtype=float)
+    n = len(x)
+    window = int(window)
+    if n == 0 or window < 2:
+        return x
+    if window > n:
+        window = n
+    kernel = np.ones(window, dtype=float) / window
+    pad_left = window // 2
+    pad_right = window - 1 - pad_left
+    x_pad = np.pad(x, (pad_left, pad_right), mode="edge")
+    y = np.convolve(x_pad, kernel, mode="valid")
+    return y
+
+
+
+# -------- Core functions --------
+
+
+
+def calibrate_mm_per_pixel(video_path, known_mm):
+    _reset_calib_points()
+
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video for calibration.")
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    mid_idx = frame_count // 2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError("Could not read calibration frame.")
+
+
+    win = "Calibration: click 2 points of known distance, press q"
+    cv2.namedWindow(win)
+    cv2.setMouseCallback(win, _on_mouse_calib)
+
+
+    while True:
+        disp = frame.copy()
+        if len(_calib_points) == 1:
+            cv2.circle(disp, _calib_points[0], 4, (0, 255, 0), -1)
+        elif len(_calib_points) == 2:
+            cv2.line(disp, _calib_points[0], _calib_points[1], (0, 255, 0), 2)
+        cv2.imshow(win, disp)
+        k = cv2.waitKey(100) & 0xFF
+        if k == ord('q') or k == 27:
+            break
+
+
+    cv2.destroyWindow(win)
+
+
+    if len(_calib_points) != 2:
+        raise RuntimeError("Calibration: need exactly 2 clicks.")
+
+
+    p1, p2 = _calib_points
+    px_dist = np.hypot(p1[0] - p2[0], p1[1] - p2[1])
+    if px_dist == 0:
+        raise RuntimeError("Calibration line has zero length.")
+    mm_per_px = known_mm / px_dist
+    return mm_per_px
+
+
+
+def select_centerline(video_path):
+    _reset_centerline_points()
+
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video for centreline.")
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    mid_idx = frame_count // 2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError("Could not read frame for centreline.")
+
+
+    win = "Centreline: click LEFT and RIGHT along tube, press q"
+    cv2.namedWindow(win)
+    cv2.setMouseCallback(win, _on_mouse_centerline)
+
+
+    while True:
+        disp = frame.copy()
+        if len(_centerline_points) == 1:
+            cv2.circle(disp, _centerline_points[0], 4, (0, 255, 255), -1)
+        elif len(_centerline_points) == 2:
+            cv2.line(disp, _centerline_points[0], _centerline_points[1], (255, 0, 0), 2)
+        cv2.imshow(win, disp)
+        k = cv2.waitKey(100) & 0xFF
+        if k == ord('q') or k == 27:
+            break
+
+
+    cv2.destroyWindow(win)
+
+
+    if len(_centerline_points) != 2:
+        raise RuntimeError("Centreline: need exactly 2 clicks.")
+
+
+    p_sorted = sorted(_centerline_points, key=lambda p: p[0])
+    return p_sorted[0], p_sorted[1]
+
+
+
+def select_zero_point(video_path, center_p1, center_p2, mm_per_px):
+    """
+    Let user click a zero point along the tube.
+    """
+    _reset_zero_point()
+
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video for zero selection.")
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    mid_idx = frame_count // 2
+    cap.set(cv2.CAP_PROP_POS_FRAMES, mid_idx)
+    ret, frame = cap.read()
+    cap.release()
+    if not ret:
+        raise RuntimeError("Could not read frame for zero selection.")
+
+
+    win = "Zero: click to place 0, press q/Esc to confirm"
+    cv2.namedWindow(win)
+    cv2.setMouseCallback(win, _on_mouse_zero)
+
+
+    while True:
+        disp = frame.copy()
+        cv2.line(disp, center_p1, center_p2, (255, 0, 0), 1)
+
+
+        if _zero_point is not None:
+            (px, py), _ = project_point_to_line(_zero_point, center_p1, center_p2)
+            cv2.circle(disp, (int(px), int(py)), 6, (0, 255, 0), -1)
+            cv2.putText(
+                disp, "Zero here", (int(px) + 10, int(py)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1
+            )
+
+
+        cv2.imshow(win, disp)
+        k = cv2.waitKey(100) & 0xFF
+        if (k == ord('q') or k == 27) and _zero_point is not None:
+            break
+
+
+    cv2.destroyWindow(win)
+
+
+    if _zero_point is None:
+        raise RuntimeError("Zero point selection aborted (no click).")
+
+
+    (_, _), s_px_zero = project_point_to_line(_zero_point, center_p1, center_p2)
+    s_mm_zero = s_px_zero * mm_per_px
+    return s_mm_zero
+
+
+
+def interactive_track_rect(video_path, mm_per_px, center_p1, center_p2):
+    """
+    Rectangle 'slab' tracking using template matching along the tube.
+    """
+    global _roi_start, _roi_end, _roi_ready
+
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError("Could not open video.")
+
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 200.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+
+    frame_idx = 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    if not ret:
+        cap.release()
+        raise RuntimeError("Could not read first frame.")
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+    play = False
+    have_template = False
+    template = None
+    roi = None
+
+
+    times = []
+    s_mm = []
+
+
+    win = "RectTrack: drag slab, SPACE play/pause, a/d step, r reset, q quit"
+    cv2.namedWindow(win)
+    cv2.setMouseCallback(win, _on_mouse_roi)
+
+
+    delay_ms = int(1000.0 / fps)
+
+
+    while True:
+        disp = frame.copy()
+        cv2.line(disp, center_p1, center_p2, (255, 0, 0), 1)
+
+
+        if _roi_start is not None and _roi_end is not None:
+            x1, y1 = _roi_start
+            x2, y2 = _roi_end
+            cv2.rectangle(disp, (x1, y1), (x2, y2), (0, 255, 255), 2)
+
+
+        if have_template and roi is not None:
+            x, y, w, h = roi
+            cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+
+            cx = x + w / 2.0
+            cy = y + h / 2.0
+            (px, py), s_px = project_point_to_line((cx, cy), center_p1, center_p2)
+            cv2.circle(disp, (int(px), int(py)), 5, (0, 0, 255), -1)
+
+
+        txt_t = frame_idx / fps
+        txt = f"{frame_idx}/{total_frames-1}, t={txt_t:.3f}s"
+        cv2.putText(disp, txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7, (0, 255, 0), 2)
+
+
+        cv2.imshow(win, disp)
+        wait_ms = delay_ms if play else 100
+        key = cv2.waitKey(wait_ms) & 0xFF
+
+
+        if key == ord('q') or key == 27:
+            break
+        elif key == ord(' '):
+            play = not play
+
+
+            if play and (not have_template) and _roi_ready:
+                x1, y1 = _roi_start
+                x2, y2 = _roi_end
+                x0, x1b = sorted([x1, x2])
+                y0, y1b = sorted([y1, y2])
+                x0 = max(0, min(gray.shape[1] - 2, x0))
+                y0 = max(0, min(gray.shape[0] - 2, y0))
+                x1b = max(x0 + 2, min(gray.shape[1], x1b))
+                y1b = max(y0 + 2, min(gray.shape[0], y1b))
+                w = x1b - x0
+                h = y1b - y0
+                template = gray[y0:y0 + h, x0:x0 + w].copy()
+                roi = (x0, y0, w, h)
+                have_template = True
+                cx = x0 + w / 2.0
+                cy = y0 + h / 2.0
+                (_, _), s_px0 = project_point_to_line((cx, cy), center_p1, center_p2)
+                times.append(frame_idx / fps)
+                s_mm.append(s_px0 * mm_per_px)
+
+
+        elif key in (ord('a'), ord(',')):
+            play = False
+            if frame_idx > 0:
+                frame_idx -= 1
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if have_template and len(times) > 0:
+                    times.pop()
+                    s_mm.pop()
+            continue
+
+
+        elif key in (ord('d'), ord('.')):
+            play = False
+            if frame_idx < total_frames - 1:
+                frame_idx += 1
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if have_template and len(times) > 0:
+                    times.pop()
+                    s_mm.pop()
+            continue
+
+
+        elif key == ord('r'):
+            play = False
+            have_template = False
+            template = None
+            roi = None
+            _roi_start = None
+            _roi_end = None
+            _roi_ready = False
+            times.clear()
+            s_mm.clear()
+            frame_idx = 0
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if not ret:
+                break
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            continue
+
+
+        if play and have_template and roi is not None:
+            # Allow larger horizontal motion per frame
+            SEARCH_MARGIN = 20  # increase if the front still outruns the box
+
+            x, y, w, h = roi
+
+            x0 = max(0, int(x - SEARCH_MARGIN))
+            x1s = min(gray.shape[1] - w, int(x + SEARCH_MARGIN))
+
+            y0 = max(0, y)
+            if x1s <= x0:
+                x1s = x0 + 1
+
+            search = gray[y0:y0 + h, x0:x1s + w]
+
+            res = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
+            _, _, _, max_loc = cv2.minMaxLoc(res)
+            dx = max_loc[0]
+            x_new = x0 + dx
+            roi = (x_new, y, w, h)
+
+            cx = x_new + w / 2.0
+            cy = y + h / 2.0
+            (_, _), s_px = project_point_to_line((cx, cy), center_p1, center_p2)
+            times.append(frame_idx / fps)
+            s_mm.append(s_px * mm_per_px)
+
+
+        if play:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_idx += 1
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+    cv2.destroyWindow(win)
+    cap.release()
+
+
+    times = np.array(times)
+    s_mm = np.array(s_mm)
+
+
+    v_all = np.zeros_like(s_mm)
+
+
+    return times, s_mm, v_all
+
+
+
+# -------- Plotting function --------
+
+
+
+def plot_front_result(times, pos_mm, vel_mm_s, numS_dist, vel_step, vel_smooth_gui):
+    if len(times) == 0:
+        messagebox.showinfo("No data", "No tracking data collected.")
+        return
+
+
+    try:
+        win_dist = int(numS_dist)
+    except ValueError:
+        win_dist = 1
+
+
+    try:
+        win_vel = int(vel_smooth_gui)
+    except ValueError:
+        win_vel = 1
+
+
+    try:
+        step = int(vel_step)
+    except ValueError:
+        step = 1
+    if step < 1:
+        step = 1
+
+
+    pos_raw = pos_mm
+    pos_smooth = moving_average(pos_raw, win_dist) if win_dist > 1 else pos_raw
+
+
+    if len(times) >= 2:
+        # velocity from smoothed distance
+        v_from_smooth = np.gradient(pos_smooth, times)
+        v_smoothed = moving_average(v_from_smooth, win_vel) if win_vel > 1 else v_from_smooth
+
+
+        # acceleration from smoothed velocity
+        a_from_v = np.gradient(v_smoothed, times)
+
+
+        mask = v_smoothed >= 0.0
+        times_plot = times[mask]
+        pos_plot = pos_smooth[mask]
+        v_plot = v_smoothed[mask]
+        a_plot = a_from_v[mask]
+
+
+        idx = np.arange(0, len(times_plot), step)
+        times_vel = times_plot[idx]
+        vel_smooth_sparse = v_plot[idx]
+    else:
+        times_plot = times
+        pos_plot = pos_smooth
+        v_plot = np.zeros_like(times)
+        a_plot = np.zeros_like(times)
+        times_vel = times
+        vel_smooth_sparse = np.zeros_like(times)
+
+
+    plt.figure(figsize=(12, 4))
+
+
+    # Distance
+    plt.subplot(1, 3, 1)
+    plt.plot(times_plot, pos_plot, '-', label=f"smoothed dist (w={win_dist})")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Position [mm]")
+    plt.title("Front position vs time")
+    plt.legend()
+
+
+    # Velocity
+    plt.subplot(1, 3, 2)
+    plt.plot(times_vel, vel_smooth_sparse, '-', color='orange',
+             label=f"velocity grad(dist_smooth)\nwv={win_vel}, step={step}")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Velocity [mm/s]")
+    plt.title("Velocity vs time")
+    plt.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+
+    # Acceleration (red)
+    plt.subplot(1, 3, 3)
+    plt.plot(times_plot, a_plot, '-', color='red', label="acceleration from v_smooth")
+    plt.xlabel("Time [s]")
+    plt.ylabel("Acceleration [mm/s²]")
+    plt.title("Acceleration vs time")
+    plt.legend(loc="upper right", fontsize=8, framealpha=0.9)
+
+
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+# -------- Tkinter GUI --------
+
+
+
+class FrontTrackerApp:
+    def __init__(self, master):
+        self.master = master
+        master.title("Interactive Paste Front Tracker (LK + Centreline)")
+
+
+        self.video_path = StringVar(master, "")
+        self.known_mm = StringVar(master, "90")
+        self.mm_per_px = None
+        self.center_p1 = None
+        self.center_p2 = None
+        self.zero_mm = None
+
+
+        self.times = None
+        self.pos_mm = None
+        self.vel = None
+
+
+        self.zero_cross_time_abs = None
+
+
+        # linear region info (from user-defined average)
+        self.linear_velocity = None
+        self.linear_end_time = None
+
+
+        Label(master, text="Video:").grid(row=0, column=0, padx=5, pady=5, sticky=W)
+        self.lb_video = Label(master, text="No file selected", width=40, anchor=W)
+        self.lb_video.grid(row=0, column=1, padx=5, pady=5, sticky=W)
+        Button(master, text="Browse", command=self.browse_video).grid(row=0, column=2, padx=5, pady=5)
+
+
+        Label(master, text="Known distance [mm]:").grid(row=1, column=0, padx=5, pady=5, sticky=W)
+        Entry(master, textvariable=self.known_mm, width=10).grid(row=1, column=1, padx=5, pady=5, sticky=W)
+        Button(master, text="Calibrate", command=self.do_calibrate).grid(row=1, column=2, padx=5, pady=5)
+
+
+        Button(master, text="Select tube centreline", command=self.do_centerline).grid(
+            row=2, column=0, columnspan=3, padx=5, pady=5, sticky=W
+        )
+        Button(master, text="Select zero point", command=self.do_zero).grid(
+            row=3, column=0, columnspan=3, padx=5, pady=5, sticky=W
+        )
+        Button(master, text="Start interactive tracking", command=self.do_track).grid(
+            row=4, column=0, columnspan=3, padx=5, pady=10, sticky=W
+        )
+
+
+        # distance smoothing
+        self.smooth_window_dist = StringVar(master, "3")
+        Label(master, text="Distance smoothing (samples):").grid(
+            row=5, column=0, padx=5, pady=5, sticky=W
+        )
+        Entry(master, textvariable=self.smooth_window_dist, width=6).grid(
+            row=5, column=1, padx=5, pady=5, sticky=W
+        )
+
+
+        # velocity smoothing
+        self.smooth_window_vel = StringVar(master, "100")
+        Label(master, text="Velocity smoothing (samples):").grid(
+            row=6, column=0, padx=5, pady=5, sticky=W
+        )
+        Entry(master, textvariable=self.smooth_window_vel, width=6).grid(
+            row=6, column=1, padx=5, pady=5, sticky=W
+        )
+
+
+        self.vel_step = StringVar(master, "10")
+        Label(master, text="Velocity tangent step (smoothed samples):").grid(
+            row=7, column=0, padx=5, pady=5, sticky=W
+        )
+        Entry(master, textvariable=self.vel_step, width=6).grid(
+            row=7, column=1, padx=5, pady=5, sticky=W
+        )
+
+
+        # average velocity cutoff
+        self.avg_t_cut = StringVar(master, "")
+        Label(master, text="Avg velocity up to t [s]:").grid(
+            row=8, column=0, padx=5, pady=5, sticky=W
+        )
+        Entry(master, textvariable=self.avg_t_cut, width=8).grid(
+            row=8, column=1, padx=5, pady=5, sticky=W
+        )
+        self.btn_compute_avg = Button(
+            master, text="Compute avg velocity", command=self.compute_avg_velocity, state=DISABLED
+        )
+        self.btn_compute_avg.grid(row=8, column=2, padx=5, pady=5, sticky=W)
+
+
+        self.btn_show_plots = Button(master, text="Show graphs", command=self.show_plots, state=DISABLED)
+        self.btn_show_plots.grid(row=9, column=0, padx=5, pady=5, sticky=W)
+
+
+        self.btn_save_csv = Button(master, text="Download data (CSV)", command=self.save_csv, state=DISABLED)
+        self.btn_save_csv.grid(row=9, column=1, padx=5, pady=5, sticky=W)
+
+
+        self.btn_show_raw_vel = Button(master, text="Show raw velocity",
+                                       command=self.show_raw_velocity, state=DISABLED)
+        self.btn_show_raw_vel.grid(row=9, column=2, padx=5, pady=5, sticky=W)
+
+
+        self.status = StringVar(master, "Ready")
+        Label(master, textvariable=self.status, anchor=W, relief=SUNKEN).grid(
+            row=10, column=0, columnspan=3, sticky="we", padx=3, pady=3
+        )
+
+
+    def browse_video(self):
+        path = filedialog.askopenfilename(
+            title="Select video",
+            filetypes=[("Video files", "*.avi *.mp4 *.mov *.mkv"), ("All files", "*.*")]
+        )
+        if path:
+            self.video_path.set(path)
+            self.lb_video.config(text=os.path.basename(path))
+            self.mm_per_px = None
+            self.center_p1 = None
+            self.center_p2 = None
+            self.zero_mm = None
+            self.times = None
+            self.pos_mm = None
+            self.vel = None
+            self.zero_cross_time_abs = None
+            self.linear_velocity = None
+            self.linear_end_time = None
+            self.btn_show_plots.config(state=DISABLED)
+            self.btn_save_csv.config(state=DISABLED)
+            self.btn_show_raw_vel.config(state=DISABLED)
+            self.btn_compute_avg.config(state=DISABLED)
+            self.status.set("Video selected. Calibrate next.")
+
+
+    def do_calibrate(self):
+        try:
+            if not self.video_path.get():
+                raise RuntimeError("Select a video first.")
+            known = float(self.known_mm.get())
+            if known <= 0:
+                raise RuntimeError("Known distance must be > 0.")
+            self.status.set("Calibrating... (OpenCV window)")
+            self.master.update_idletasks()
+            self.mm_per_px = calibrate_mm_per_pixel(self.video_path.get(), known)
+            self.status.set(f"Calibration done: {self.mm_per_px:.5f} mm/px")
+        except Exception as e:
+            messagebox.showerror("Calibration error", str(e))
+            self.status.set("Calibration failed.")
+
+
+    def do_centerline(self):
+        try:
+            if not self.video_path.get():
+                raise RuntimeError("Select a video first.")
+            self.status.set("Select centreline... (OpenCV window)")
+            self.master.update_idletasks()
+            self.center_p1, self.center_p2 = select_centerline(self.video_path.get())
+            self.status.set(f"Centreline set: {self.center_p1} → {self.center_p2}")
+        except Exception as e:
+            messagebox.showerror("Centreline error", str(e))
+            self.status.set("Centreline selection failed.")
+
+
+    def do_zero(self):
+        try:
+            if not self.video_path.get():
+                raise RuntimeError("Select a video first.")
+            if self.mm_per_px is None:
+                raise RuntimeError("Calibrate first.")
+            if self.center_p1 is None or self.center_p2 is None:
+                raise RuntimeError("Select tube centreline first.")
+            self.status.set("Select zero point... (OpenCV window)")
+            self.master.update_idletasks()
+            self.zero_mm = select_zero_point(
+                self.video_path.get(), self.center_p1, self.center_p2, self.mm_per_px
+            )
+            self.status.set(f"Zero point set at {self.zero_mm:.3f} mm along centreline")
+        except Exception as e:
+            messagebox.showerror("Zero point error", str(e))
+            self.status.set("Zero point selection failed.")
+            self.zero_mm = None
+
+
+    def do_track(self):
+        try:
+            if not self.video_path.get():
+                raise RuntimeError("Select a video first.")
+            if self.mm_per_px is None:
+                raise RuntimeError("Calibrate first.")
+            if self.center_p1 is None or self.center_p2 is None:
+                raise RuntimeError("Select tube centreline first.")
+
+
+            if self.zero_mm is None:
+                ans = messagebox.askyesno(
+                    "Zero point not selected",
+                    "You have not selected a zero point.\n\n"
+                    "Yes = Continue without zero (positions are from left centreline click).\n"
+                    "No  = Go to zero selection window now."
+                )
+                if not ans:
+                    self.do_zero()
+                    if self.zero_mm is None:
+                        self.status.set("Zero point not set. Tracking cancelled.")
+                        return
+
+
+            self.status.set("Interactive tracking running... (see OpenCV window)")
+            self.master.update_idletasks()
+
+
+            times, pos_mm_raw, vel_raw = interactive_track_rect(
+                self.video_path.get(), self.mm_per_px, self.center_p1, self.center_p2
+            )
+
+
+            if len(times) == 0:
+                self.times = times
+                self.pos_mm = pos_mm_raw
+                self.vel = vel_raw
+                self.linear_velocity = None
+                self.linear_end_time = None
+                self.status.set("No data collected.")
+                self.btn_show_plots.config(state=DISABLED)
+                self.btn_save_csv.config(state=DISABLED)
+                self.btn_show_raw_vel.config(state=DISABLED)
+                self.btn_compute_avg.config(state=DISABLED)
+                return
+
+
+            if self.zero_mm is not None:
+                pos_shifted = pos_mm_raw - self.zero_mm
+                mask = pos_shifted >= 0
+                if np.any(mask):
+                    times_masked = times[mask]
+                    pos_shifted = pos_shifted[mask]
+                    self.status.set("Tracking finished (shifted to manual zero, negatives dropped).")
+                else:
+                    times_masked = times
+                    pos_shifted = pos_mm_raw
+                    self.status.set("Zero was ahead of all data; using unshifted positions.")
+                self.pos_mm = pos_shifted
+                self.times = times_masked
+            else:
+                self.times = times
+                self.pos_mm = pos_mm_raw
+                self.status.set("Tracking finished. (Zero at left centreline click)")
+
+
+            self.zero_cross_time_abs = None
+            if self.zero_mm is not None and self.times is not None and len(self.times) >= 2:
+                t_masked = self.times.astype(float)
+                s_masked = self.pos_mm.astype(float)
+
+
+                sign = np.sign(s_masked)
+                sign[sign == 0] = 1
+                changes = np.where(sign[1:] * sign[:-1] < 0)[0]
+
+
+                if changes.size > 0:
+                    i = changes[0]
+                    t0_rel = np.interp(0.0, [s_masked[i], s_masked[i + 1]],
+                                       [t_masked[i], t_masked[i + 1]])
+                    self.zero_cross_time_abs = float(t0_rel)
+                    self.times = self.times - t0_rel
+                else:
+                    nonneg = np.where(s_masked >= 0)[0]
+                    if nonneg.size > 0:
+                        t0_rel = t_masked[nonneg[0]]
+                        self.zero_cross_time_abs = float(t0_rel)
+                        self.times = self.times - t0_rel
+
+
+            if self.zero_cross_time_abs is not None:
+                self.status.set(
+                    f"Tracking finished. Zero crossed at t={self.zero_cross_time_abs:.4f} s from video start."
+                )
+
+
+            self.btn_show_plots.config(state=NORMAL)
+            self.btn_save_csv.config(state=NORMAL)
+            self.btn_show_raw_vel.config(state=NORMAL)
+            self.btn_compute_avg.config(state=NORMAL)
+
+
+        except Exception as e:
+            messagebox.showerror("Tracking error", str(e))
+            self.status.set("Tracking failed.")
+            self.btn_show_plots.config(state=DISABLED)
+            self.btn_save_csv.config(state=DISABLED)
+            self.btn_show_raw_vel.config(state=DISABLED)
+            self.btn_compute_avg.config(state=DISABLED)
+
+
+    def show_plots(self):
+        if self.times is None or len(self.times) == 0:
+            messagebox.showinfo("No data", "No tracking data collected.")
+            return
+        plot_front_result(
+            self.times,
+            self.pos_mm,
+            self.vel,
+            self.smooth_window_dist.get(),
+            self.vel_step.get(),
+            self.smooth_window_vel.get()
+        )
+
+
+    def show_raw_velocity(self):
+        if self.times is None or len(self.times) == 0:
+            messagebox.showinfo("No data", "No tracking data collected.")
+            return
+
+
+        win_dist = int(self.smooth_window_dist.get()) if self.smooth_window_dist.get().isdigit() else 1
+        pos_smooth = moving_average(self.pos_mm, win_dist) if win_dist > 1 else self.pos_mm
+        if len(self.times) >= 2:
+            v_from_smooth = np.gradient(pos_smooth, self.times)
+        else:
+            v_from_smooth = np.zeros_like(self.times)
+
+
+        plt.figure(figsize=(8, 4))
+        plt.plot(self.times, v_from_smooth, '-', alpha=0.8)
+        plt.xlabel("Time [s]")
+        plt.ylabel("Velocity [mm/s]")
+        plt.title("Velocity from smoothed distance vs time")
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
+
+
+    def compute_avg_velocity(self):
+        if self.times is None or len(self.times) < 2:
+            messagebox.showinfo("No data", "No tracking data collected.")
+            return
+
+
+        try:
+            t_cut = float(self.avg_t_cut.get())
+        except ValueError:
+            messagebox.showerror("Input error", "Please enter a valid cutoff time (seconds).")
+            return
+
+
+        if t_cut <= 0:
+            messagebox.showerror("Input error", "Cutoff time must be > 0.")
+            return
+
+
+        t = self.times
+        s = self.pos_mm
+
+
+        mask = t <= t_cut
+        if not np.any(mask):
+            messagebox.showerror("Input error", "No data points at or before the specified time.")
+            return
+
+
+        t_sel = t[mask]
+        s_sel = s[mask]
+
+
+        dt = t_sel[-1] - t_sel[0]
+        if dt <= 0:
+            messagebox.showerror("Computation error", "Selected time interval has zero duration.")
+            return
+
+
+        ds = s_sel[-1] - s_sel[0]
+        v_avg = ds / dt  # mm/s
+
+
+        # store as linear-region info for CSV/export
+        self.linear_velocity = v_avg
+        self.linear_end_time = float(t_sel[-1])
+
+
+        messagebox.showinfo(
+            "Average velocity",
+            f"Average velocity from t={t_sel[0]:.3f} s to t={t_sel[-1]:.3f} s\n"
+            f"(requested cutoff t={t_cut:.3f} s):\n\n"
+            f"v_avg = {v_avg:.3f} mm/s"
+        )
+
+
+    def save_csv(self):
+        if self.times is None or len(self.times) == 0:
+            messagebox.showinfo("No data", "No tracking data collected.")
+            return
+
+
+        try:
+            win_dist = int(self.smooth_window_dist.get())
+        except ValueError:
+            win_dist = 1
+
+
+        try:
+            win_vel = int(self.smooth_window_vel.get())
+        except ValueError:
+            win_vel = 1
+
+
+        try:
+            step = int(self.vel_step.get())
+        except ValueError:
+            step = 1
+        if step < 1:
+            step = 1
+
+
+        pos_raw = self.pos_mm
+        pos_smooth = moving_average(pos_raw, win_dist) if win_dist > 1 else pos_raw
+
+
+        if len(self.times) >= 2:
+            v_from_smooth = np.gradient(pos_smooth, self.times)
+            v_smoothed = moving_average(v_from_smooth, win_vel) if win_vel > 1 else v_from_smooth
+
+
+            # acceleration from smoothed velocity (full resolution)
+            a_from_v = np.gradient(v_smoothed, self.times)
+
+
+            mask = v_smoothed >= 0.0
+            times_csv = self.times[mask]
+            pos_csv = pos_smooth[mask]
+            pos_raw_csv = pos_raw[mask]
+            v_all_csv = v_from_smooth[mask]
+            v_all_smoothed = v_smoothed[mask]
+            a_all_csv = a_from_v[mask]
+
+
+            idx = np.arange(0, len(times_csv), step)
+            times_vel = times_csv[idx]
+            vel_tangent_sparse = v_all_smoothed[idx]
+        else:
+            times_csv = self.times
+            pos_csv = pos_smooth
+            pos_raw_csv = pos_raw
+            v_all_csv = np.zeros_like(self.times)
+            v_all_smoothed = v_all_csv
+            a_all_csv = np.zeros_like(self.times)
+            times_vel = times_csv
+            vel_tangent_sparse = np.zeros_like(times_csv)
+
+
+        tangent_full = np.interp(times_csv, times_vel, vel_tangent_sparse) if len(times_vel) > 1 else vel_tangent_sparse
+
+
+        # forced-linear version of smoothed velocity: plateau at user-defined avg up to linear_end_time
+        forced_linear = v_all_smoothed.copy()
+        if self.linear_velocity is not None and self.linear_end_time is not None:
+            mask_plateau = times_csv <= self.linear_end_time
+            forced_linear[mask_plateau] = self.linear_velocity
+
+
+        base = os.path.splitext(os.path.basename(self.video_path.get()))[0]
+
+
+        # main full-length table (no sparse column here)
+        df = pd.DataFrame({
+            "time_s": times_csv,
+            "position_raw_mm": pos_raw_csv,
+            "position_smoothed_mm": pos_csv,
+            "velocity_from_smooth_mm_per_s": v_all_csv,
+            "velocity_smoothed_mm_per_s": v_all_smoothed,
+            "velocity_interp_mm_per_s": tangent_full,
+            "velocity_forced_linear_mm_per_s": forced_linear,
+            "acceleration_mm_per_s2": a_all_csv
+        })
+
+
+        out_path = filedialog.asksaveasfilename(
+            parent=self.master,
+            title="Save tracking CSV",
+            defaultextension=".csv",
+            initialfile=base + "_front_track_centerline_zeroed.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+        if out_path:
+            # write main table
+            df.to_csv(out_path, index=False)
+
+
+            # meta + sparse blocks
+            meta = {}
+            if self.zero_cross_time_abs is not None:
+                meta["zero_cross_time_s_from_video_start"] = [self.zero_cross_time_abs]
+            if self.linear_velocity is not None:
+                meta["linear_region_velocity_mm_per_s"] = [self.linear_velocity]
+            if self.linear_end_time is not None:
+                meta["linear_region_end_time_s"] = [self.linear_end_time]
+            if self.mm_per_px is not None:
+                meta["calibration_mm_per_pixel"] = [self.mm_per_px]            
+
+
+            with open(out_path, "a", newline="") as f:
+                if meta:
+                    f.write("\n")
+                    meta_df = pd.DataFrame(meta)
+                    meta_df.to_csv(f, index=False)
+
+
+                if len(times_vel) > 0:
+                    f.write("\n")
+                    sparse_df = pd.DataFrame({
+                        "time_sparse_s": times_vel,
+                        "velocity_sparse_mm_per_s": vel_tangent_sparse
+                    })
+                    sparse_df.to_csv(f, index=False)
+
+
+            msg = f"Saved results to:\n{out_path}"
+            if self.zero_cross_time_abs is not None:
+                msg += f"\nZero crossed at t = {self.zero_cross_time_abs:.4f} s from video start."
+            if self.linear_velocity is not None:
+                msg += f"\nLinear-region v ≈ {self.linear_velocity:.3f} mm/s (end t ≈ {self.linear_end_time:.3f} s)."
+            messagebox.showinfo("Saved", msg)
+
+
+
+def main():
+    root = Tk()
+    root.geometry("860x420")
+    app = FrontTrackerApp(root)
+    root.mainloop()
+
+
+
+if __name__ == "__main__":
+    main()
