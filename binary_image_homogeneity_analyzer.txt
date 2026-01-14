@@ -1,0 +1,310 @@
+import os
+import glob
+import shutil
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import cdist
+from google.colab import files
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+MM_PER_PIXEL = 75.7 / 4400
+
+def gini(array):
+    array = np.array(array, dtype=np.float64)
+    if np.amin(array) < 0:
+        array -= np.amin(array)
+    array = np.sort(array)
+    n = len(array)
+    if n == 0:
+        return np.nan
+    index = np.arange(1, n + 1)
+    return ((np.sum((2 * index - n - 1) * array)) / (n * np.sum(array)))
+
+def save_and_show(fig, fname):
+    fig.tight_layout()
+    fig.savefig(fname, dpi=300)
+    plt.show()
+    plt.close(fig)
+
+out = widgets.Output()
+row_widget = widgets.IntText(value=10, description='Rows:', min=1)
+col_widget = widgets.IntText(value=10, description='Cols:', min=1)
+button = widgets.Button(description="Confirm grid size")
+multi_scale_button = widgets.Button(description="Run Multi-Scale Analysis")
+download_button = widgets.Button(description="Download All Results Zip")
+
+uploaded = files.upload()
+filename = next(iter(uploaded))
+img = cv2.imread(filename, cv2.IMREAD_UNCHANGED)
+if img is None:
+    raise ValueError('No image loaded.')
+
+if img.ndim == 3:
+    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+else:
+    img_gray = img
+_, img_binary_thresh = cv2.threshold(img_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+img_binary = img_binary_thresh > 0  # white=1, black=0
+
+result_dir = "analysis_outputs"
+os.makedirs(result_dir, exist_ok=True)
+basename = os.path.splitext(os.path.basename(filename))[0]
+
+plt.figure()
+plt.imshow(img_binary, cmap='gray')
+plt.title('Unedited Binary Image (white=1, black=0)')
+plt.axis('off')
+plt.savefig(f"{result_dir}/{basename}_binary.png", dpi=300)
+plt.show()
+
+def analyze_and_plot(rows, cols):
+    clear_output(wait=True)
+    files_to_remove = glob.glob(result_dir + '/*')
+    for f in files_to_remove:
+        os.remove(f)
+
+    fig = plt.figure()
+    plt.imshow(img_binary, cmap='gray')
+    plt.title('Unedited Binary Image (white=1, black=0)')
+    plt.axis('off')
+    save_and_show(fig, f"{result_dir}/{basename}_binary.png")
+
+    display(widgets.HBox([row_widget, col_widget, button, multi_scale_button, download_button]), out)
+    with out:
+        rowSize, colSize = img_binary.shape
+        cellHeight = rowSize // rows
+        cellWidth = colSize // cols
+        cellHeight_mm = cellHeight * MM_PER_PIXEL
+        cellWidth_mm = cellWidth * MM_PER_PIXEL
+
+        fig, ax = plt.subplots()
+        ax.imshow(img_binary, cmap='gray')
+        for r in range(1, rows):
+            ax.axhline(r * cellHeight - 0.5, color='red', linewidth=1.5)
+        for c in range(1, cols):
+            ax.axvline(c * cellWidth - 0.5, color='red', linewidth=1.5)
+        ax.axhline(rowSize - 0.5, color='red', linewidth=1.5)
+        ax.axvline(colSize - 0.5, color='red', linewidth=1.5)
+        ax.set_title('Grid Overlay')
+        save_and_show(fig, f"{result_dir}/{basename}_grid.png")
+
+        localConc = np.zeros((rows, cols))
+        for r in range(rows):
+            for c in range(cols):
+                rowStart = r * cellHeight
+                colStart = c * cellWidth
+                rowEnd = rowSize if r == rows - 1 else (r + 1) * cellHeight
+                colEnd = colSize if c == cols - 1 else (c + 1) * cellWidth
+                cell = img_binary[rowStart:rowEnd, colStart:colEnd]
+                cell_inverted = 1 - cell
+                localConc[r, c] = np.sum(cell_inverted) / cell.size
+
+        meanConc = np.mean(localConc)
+        stdConc = np.std(localConc)
+        CV = stdConc / meanConc if meanConc > 0 else np.nan
+        varianceConc = np.var(localConc)
+        indexDispersion = varianceConc / meanConc if meanConc > 0 else np.nan
+
+        print(f"Coefficient of Variation (CV): {CV:.4f}")
+        print(f"Index of Dispersion (ID): {indexDispersion:.4f}")
+        print(f"Grid cell size: ({cellHeight_mm:.2f} mm × {cellWidth_mm:.2f} mm)")
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        im = ax.imshow(localConc, cmap='magma', vmin=0, vmax=1, interpolation='nearest',
+                       aspect='equal',
+                       extent=[0, cellWidth_mm * cols, 0, cellHeight_mm * rows])
+        ax.set_xticks(np.arange(0, cellWidth_mm * cols + 1, 2))
+        ax.set_yticks(np.arange(0, cellHeight_mm * rows + 1, 2))
+        ax.set_xlabel('Distance (mm)')
+        ax.set_ylabel('Distance (mm)')
+        ax.set_title('Local Concentrations Heatmap')
+        divider = make_axes_locatable(ax)
+        cax = divider.append_axes("right", size="5%", pad=0.05)
+        plt.colorbar(im, cax=cax, orientation='vertical')
+        save_and_show(fig, f"{result_dir}/{basename}_heatmap.png")
+
+        img_for_contours = (img_binary == 0).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        img_opened = cv2.morphologyEx(img_for_contours, cv2.MORPH_OPEN, kernel)
+        contours, _ = cv2.findContours(img_opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        min_area = 2
+        filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area]
+
+        centroids = []
+        patch_areas = []
+        total_black_pixels = np.sum(img_for_contours > 0)
+        total_pixels = rowSize * colSize
+
+        for cnt in filtered_contours:
+            M = cv2.moments(cnt)
+            if M['m00'] != 0:
+                cX = M['m10'] / M['m00']
+                cY = M['m01'] / M['m00']
+                centroids.append([cY, cX])
+                patch_areas.append(cv2.contourArea(cnt))
+        centroids = np.array(centroids)
+        patch_areas = np.array(patch_areas)
+        patch_areas_mm2 = patch_areas * (MM_PER_PIXEL ** 2)
+        total_area_mm2 = (rowSize * colSize) * (MM_PER_PIXEL ** 2)
+        norm_patch_areas = patch_areas_mm2 / total_area_mm2
+        total_patch_area_mm2 = np.sum(patch_areas_mm2)
+
+        print(f"Detected {len(centroids)} black points via contours.")
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+        ax1.hist(norm_patch_areas, bins=np.logspace(np.log10(1e-6), 0, 40), color='darkorange', edgecolor='black')
+        ax1.axvline(np.max(norm_patch_areas), color='red', linestyle='--', label='Largest Patch')
+        ax1.set_xscale('log')
+        ax1.set_xlabel('Normalized Patch Area (fraction of image)')
+        ax1.set_ylabel('Count')
+        ax1.set_title('Histogram of Normalized Patch Areas (log scale)')
+        ax1.legend()
+
+        patch_area_bins = np.logspace(-4, 3, 40)
+        n_patches, bin_edges = np.histogram(patch_areas_mm2, bins=patch_area_bins)
+        tallest_idx = np.argmax(n_patches)
+        most_freq_patch_range = (bin_edges[tallest_idx], bin_edges[tallest_idx + 1])
+
+        ax2.hist(patch_areas_mm2, bins=patch_area_bins, color='dodgerblue', edgecolor='black')
+        ax2.axvline(np.max(patch_areas_mm2), color='red', linestyle='--', label='Largest Patch')
+        ax2.set_xscale('log')
+        ax2.set_xlim([1e-4, 1e3])
+        ax2.set_xlabel('Patch Area (mm²)')
+        ax2.set_ylabel('Count')
+        ax2.set_title('Histogram of Patch Areas (log scale)')
+        ax2.legend()
+
+        plt.tight_layout()
+        save_and_show(fig, f"{result_dir}/{basename}_patch_histograms_comparison.png")
+
+        print(f"Total patch area (mm²): {total_patch_area_mm2:.4f}")
+        print(f"Most frequent patch size range (mm²): {most_freq_patch_range[0]:.4g} – {most_freq_patch_range[1]:.4g}")
+
+        if patch_areas_mm2.size > 0:
+            largest_patch_area_mm2 = np.max(patch_areas_mm2)
+            largest_patch_fraction = np.max(norm_patch_areas)
+            patch_gini = gini(patch_areas_mm2)
+            print(f"Largest patch area (mm²): {largest_patch_area_mm2:.4f}")
+            print(f"Largest patch fraction of black pixels: {largest_patch_fraction:.4f}")
+            print(f"Gini coefficient on patch areas: {patch_gini:.4f}")
+            print(f"90th percentile normalized patch size: {np.percentile(norm_patch_areas, 90):.4e}")
+            print(f"99th percentile normalized patch size: {np.percentile(norm_patch_areas, 99):.4e}")
+        else:
+            largest_patch_area_mm2 = np.nan
+            largest_patch_fraction = np.nan
+            patch_gini = np.nan
+            print("No patches found for size and Gini analysis.")
+
+        if centroids.size == 0:
+            print("No objects detected.")
+            return
+
+        D = cdist(centroids, centroids)
+        np.fill_diagonal(D, np.inf)
+        minDist_px = np.min(D, axis=1)
+        meanNND_px = np.mean(minDist_px)
+        meanNND_mm = meanNND_px * MM_PER_PIXEL
+
+        print(f"Mean nearest neighbor distance (mm): {meanNND_mm:.3f}")
+
+        fig = plt.figure()
+        plt.imshow(img_binary, cmap='gray')
+        plt.plot(centroids[:, 1], centroids[:, 0], 'ro', markersize=6, linewidth=2)
+        for i, j in enumerate(np.argmin(D, axis=1)):
+            plt.plot([centroids[i, 1], centroids[j, 1]], [centroids[i, 0], centroids[j, 0]], 'b-', linewidth=1.5)
+        plt.title(f'Mean NND: {meanNND_mm:.2f} mm')
+        plt.axis('off')
+        save_and_show(fig, f"{result_dir}/{basename}_nnd.png")
+
+        N = len(centroids)
+        area_px = rowSize * colSize
+        maxR_px = min(rowSize, colSize) / 2
+        radii_px = np.linspace(1, maxR_px, 50)
+        radii_mm = radii_px * MM_PER_PIXEL
+        K = np.zeros_like(radii_px)
+        for i in range(N):
+            dists = np.sqrt(np.sum((centroids[i] - centroids) ** 2, axis=1))
+            for j, R in enumerate(radii_px):
+                K[j] += np.sum(dists < R) - 1
+        K = K / N
+        lambda_ = N / area_px
+        K = K / lambda_
+        L = np.sqrt(K / np.pi)
+        L_mm = L * MM_PER_PIXEL
+
+        fig = plt.figure()
+        plt.plot(radii_mm, L_mm, 'b-', linewidth=2)
+        plt.plot(radii_mm, radii_mm, 'k--', linewidth=1.5)
+        plt.xlabel('Radius (mm)')
+        plt.ylabel('L(r) (mm)')
+        plt.legend(['Observed L(r)', 'Random (L(r)=r)'], loc='upper left')
+        plt.title("Ripley's L function (mm)")
+        plt.grid(True)
+        save_and_show(fig, f"{result_dir}/{basename}_ripleyL.png")
+
+        results_text = (
+            f'Final results for {filename}:\n'
+            f'Coefficient of Variation (CV): {CV:.4f}\n'
+            f'Index of Dispersion (ID): {indexDispersion:.4f}\n'
+            f'Largest patch area (mm²): {largest_patch_area_mm2:.4f}\n'
+            f'Total patch area (mm²): {total_patch_area_mm2:.4f}\n'
+            f'Most frequent patch size range (mm²): {most_freq_patch_range[0]:.4g} – {most_freq_patch_range[1]:.4g}\n'
+            f'Largest patch fraction: {largest_patch_fraction:.4f}\n'
+            f'Gini coefficient on patch areas: {patch_gini:.4f}\n'
+            f'Mean nearest neighbor distance (mm): {meanNND_mm:.3f}\n'
+        )
+        with open(f"{result_dir}/{basename}_results.txt", "w") as f:
+            f.write(results_text)
+
+        shutil.make_archive('analysis_outputs', 'zip', result_dir)
+
+def download_all_results(b):
+    files.download('analysis_outputs.zip')
+
+download_button.on_click(download_all_results)
+
+def multi_scale_analysis(grid_sizes):
+    rowSize, colSize = img_binary.shape
+    cvs = []
+    ids = []
+    cell_sizes_mm = []
+    for n in grid_sizes:
+        cellHeight = rowSize // n
+        cellWidth = colSize // n
+        cell_size_mm = (cellHeight * MM_PER_PIXEL + cellWidth * MM_PER_PIXEL) / 2
+        cell_sizes_mm.append(cell_size_mm)
+
+        localConc = np.zeros((n, n))
+        for r in range(n):
+            for c in range(n):
+                rowStart = r * cellHeight
+                colStart = c * cellWidth
+                rowEnd = rowSize if r == n - 1 else (r + 1) * cellHeight
+                colEnd = colSize if c == n - 1 else (c + 1) * cellWidth
+                cell = img_binary[rowStart:rowEnd, colStart:colEnd]
+                cell_inverted = 1 - cell
+                localConc[r, c] = np.sum(cell_inverted) / cell.size
+
+        meanConc = np.mean(localConc)
+        varianceConc = np.var(localConc)
+        cvs.append(np.std(localConc) / meanConc if meanConc > 0 else np.nan)
+        ids.append(varianceConc / meanConc if meanConc > 0 else np.nan)
+
+    fig = plt.figure(figsize=(10, 5))
+    plt.plot(cell_sizes_mm, cvs, 'b-o', label='CV')
+    plt.plot(cell_sizes_mm, ids, 'r-s', label='Index of Dispersion')
+    plt.xlabel('Grid cell size (mm)')
+    plt.ylabel('Metric Value')
+    plt.title('Multi-scale Homogeneity Analysis (mm)')
+    plt.legend()
+    plt.grid(True)
+    save_and_show(fig, f"{result_dir}/{basename}_multiscale.png")
+
+button.on_click(lambda b: analyze_and_plot(row_widget.value, col_widget.value))
+multi_scale_button.on_click(lambda b: multi_scale_analysis(list(range(5, 51, 5))))
+display(widgets.HBox([row_widget, col_widget, button, multi_scale_button, download_button]), out)
