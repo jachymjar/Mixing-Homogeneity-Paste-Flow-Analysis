@@ -1,0 +1,62 @@
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+from google.colab import files
+import ipywidgets as widgets
+from IPython.display import display
+
+# Parameters
+num_patches = 144
+target_area = 176    # area in pixels
+img_size = 1300
+
+def best_radius_for_area(target_area):
+    max_r = img_size // 2
+    best_r = 1
+    best_err = None
+    best_area = None
+    for r in range(2, max_r):
+        test = np.ones((r*2+10, r*2+10), dtype=np.uint8) * 255
+        cv2.circle(test, (r+5, r+5), r, 0, thickness=-1)
+        area = np.sum(test == 0)
+        err = abs(area - target_area)
+        if best_err is None or err < best_err:
+            best_err = err
+            best_r = r
+            best_area = area
+    return best_r, best_area
+
+dot_radius, actual_area = best_radius_for_area(target_area)
+
+img = np.ones((img_size, img_size), dtype=np.uint8) * 255
+
+for _ in range(num_patches):
+    center_x = np.random.randint(dot_radius, img_size-dot_radius)
+    center_y = np.random.randint(dot_radius, img_size-dot_radius)
+    cv2.circle(img, (center_x, center_y), dot_radius, 0, thickness=-1)
+
+plt.figure(figsize=(8, 8))
+plt.imshow(img, cmap='gray')
+plt.title(f'Random dot model ({num_patches} dots, dot area: {actual_area} px, radius: {dot_radius})')
+plt.axis('off')
+plt.tight_layout()
+plt.show()
+
+actual_total_black = np.sum(img == 0)
+expected_total_black = num_patches * actual_area
+
+print(f"Generated image shape: {img.shape}")
+print(f"Target dot area: {target_area} px")
+print(f"Selected dot radius: {dot_radius} px")
+print(f"Measured area per dot: {actual_area} px")
+print(f"Expected total area (no overlap): {expected_total_black} px")
+print(f"Actual total black pixels: {actual_total_black} px")
+
+filename = f'model_randdots_{img_size}px.png'
+cv2.imwrite(filename, img)
+
+download_button = widgets.Button(description="Download Image")
+def download_image(b):
+    files.download(filename)
+download_button.on_click(download_image)
+display(download_button)
