@@ -1,0 +1,78 @@
+import pandas as pd
+import numpy as np
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+
+# 1. Load Data
+file_path = "Creep_P15A.csv"
+df = pd.read_csv(file_path)
+df.columns = df.columns.str.strip()
+
+# Adjusting headers based on your first file structure
+time = df.iloc[:, 0].to_numpy(dtype=float)
+strain = df.iloc[:, 1].to_numpy(dtype=float)
+
+# 2. Robust Detection (Finding unloading point)
+abs_max_idx = np.argmax(strain)
+t_u = time[abs_max_idx]
+
+# Split data if you want to fit the entire joint curve
+# (Using the joint model logic from your first script)
+t_fit = time
+strain_actual = strain
+
+# 3. Model and Fit (Burgers 6-Element Joint Model)
+def burgers6_joint(t, a0, a1, a2, tau2, a3, tau3):
+    t = np.asarray(t, dtype=float)
+    eps_hat = np.empty_like(t)
+    
+    # Creep Phase
+    mask_creep = t <= t_u
+    tc = t[mask_creep]
+    eps_hat[mask_creep] = a0 + a1*tc + a2*(1 - np.exp(-tc/tau2)) + a3*(1 - np.exp(-tc/tau3))
+    
+    # Recovery Phase
+    mask_rec = ~mask_creep
+    tr = t[mask_rec]
+    dt = tr - t_u
+    kel2_at_u = a2*(1 - np.exp(-t_u/tau2))
+    kel3_at_u = a3*(1 - np.exp(-t_u/tau3))
+    eps_hat[mask_rec] = a1*t_u + kel2_at_u*np.exp(-dt/tau2) + kel3_at_u*np.exp(-dt/tau3)
+    
+    return eps_hat
+
+# Initial guesses
+p0 = [strain[0], 1e-4, strain[abs_max_idx]*0.3, 5.0, strain[abs_max_idx]*0.2, 50.0]
+bounds = ([0, 0, 0, 1e-6, 0, 1e-6], [np.inf, np.inf, np.inf, np.inf, np.inf, np.inf])
+
+params, cov = curve_fit(burgers6_joint, t_fit, strain_actual, p0=p0, bounds=bounds, maxfev=800000)
+
+# 4. R2 Calculation
+y_pred = burgers6_joint(t_fit, *params)
+r_squared = 1 - (np.sum((strain_actual - y_pred)**2) / np.sum((strain_actual - np.mean(strain_actual))**2))
+
+# 5. Plotting
+plt.figure(figsize=(8, 6))
+
+# SET FONT SIZES EXPLICITLY HERE
+fs = 14 
+
+plt.plot(time, strain, label="Raw data")
+plt.plot(t_fit, y_pred, label="Burgers 6-elem fit")
+plt.axvline(t_u, linestyle="--", label="Max strain point")
+
+plt.xlabel("Time (s)", fontsize=fs)
+plt.ylabel("Strain", fontsize=fs)
+plt.legend(fontsize=fs-2)
+plt.xticks(fontsize=fs-2)
+plt.yticks(fontsize=fs-2)
+
+plt.show()
+
+# 6. Display Table
+df_params = pd.DataFrame({
+    "Parameter": ["a0", "a1", "a2", "tau2 (s)", "a3", "tau3 (s)", "R-Squared"],
+    "Value": np.append(params, r_squared)
+})
+
+df_params
